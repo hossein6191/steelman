@@ -1,0 +1,72 @@
+[10:08:19] P  0x83dfd14440b734b21f96B871b89A5eD5e78DC5C4  the proposer
+           A  0xb39fbc6b76431f5ECA5fC3d95995953aa9063F11  objector A, who restates faithfully
+           B  0x916340d472e62A5C7dfB027a8201E3257E3258D6  objector B, who argues with a strawman
+           S  0x27f3425a517C4F9bCf5CB9F10BAeAEf6e4BF1650  a stranger
+           R  0x12Dd81A4dbA8d07C2747AfB614A22841D54a87A4  the recipient, no key
+
+[10:08:19] ---- 1: deploy, and a window too short to object in
+      [10:24:37] P deploy steelman.py  0x677c88c86a291300a830d00826b46edb11ea0199092d51422eca3e144fea7c24  5 agree, 0 disagree, 0 idle  SUCCESS  0x6a4dc84a990e6117A137c8580FbaDfDB76f56A02
+      Steelman at 0x6a4dc84a990e6117A137c8580FbaDfDB76f56A02
+      [10:30:44] P propose(Translate the beginner, Spend 3 GEN from the c, 0x12Dd81A4dbA8d07C2747, 60, 1, 1000000000000000000) +3 GEN  0x559ea715a08f8d0d22eb6162e03be7492816223c5371f947fdbf11d4546fe127  4 agree, 0 disagree, 1 idle  SUCCESS
+PASS  a proposal with a one-minute window is refused and its 3 GEN come back  - 4 agree, 0 disagree, 1 idle  the objection window is 300 to 1209600 seconds, written as a whole number
+
+[10:30:54] ---- 2: P1, a strawman and a faithful restatement
+      [10:31:55] P propose(Translate the beginner, Spend 3 GEN from the c, 0x12Dd81A4dbA8d07C2747, 300, 1, 1000000000000000000) +3 GEN  0x40327b4195bf765a4f2666fcbdb8673e0bc506f31036d5437fa83e2eaf85280e  5 agree, 0 disagree, 0 idle  SUCCESS
+PASS  P1 is opened with 3 GEN behind it, threshold 1, bond 1 GEN, window 300 s  - 5 agree, 0 disagree, 0 idle  {"ok": true, "proposal": "P1", "value": "3000000000000000000", "bond": "1000000000000000000", "threshold": 1, "opened_at
+      [10:33:03] B object(P1, Hand the whole fund to, Nobody should get the ) +1 GEN  0xe9c0f15cf7e3a8d5ced016d428d998b6ecd104a8b8199a507065c84b8bf9715b  3 agree, 0 disagree, 2 idle  SUCCESS
+      [10:33:24] A object(P1, Pay one translator 3 G, The beginner guide is ) +1 GEN  0xf639467a20a4bcc201682f8e61fc1a532bb3dac6c5a2582cd544b438e0176983  3 agree, 0 disagree, 2 idle  SUCCESS
+PASS  B's strawman is read as distorted in both framings  - 3 agree, 0 disagree, 2 idle  distorted
+PASS  and B's bond goes to the proposer in the same transaction  - {"b":"-1000000000000000000","p":"1000000000000000000"}
+PASS  A's restatement is read as faithful and counts  - 3 agree, 0 disagree, 2 idle  faithful
+PASS  and A's bond is held, not spent  - {"a":"-1000000000000000000"}
+PASS  proposal(P1): one faithful objection, one bond held, and it would be blocked  - {"faithful":1,"distorted":1,"held":"1000000000000000000","would_be":"blocked"}
+
+[10:33:26] ---- 3: P2, the revised proposal, and the refusals that ask no model
+      [10:40:22] P propose(Translate the rewritte, Spend 3 GEN from the c, 0x12Dd81A4dbA8d07C2747, 900, 1, 1000000000000000000) +3 GEN  0x219b0b2266a9213c1d31f732efff4e8b952ea93990d8c6328865f7a98ef15bdb  3 agree, 0 disagree, 2 idle  SUCCESS
+PASS  P2, which names the rewritten guide, is opened with the same terms and a 900-second window  - 3 agree, 0 disagree, 2 idle  {"ok": true, "proposal": "P2", "value": "3000000000000000000", "bond": "1000000000000000000", "threshold": 1, "opened_at
+      [10:41:21] S close(P2)  0x1c4175ae7d43aaddaee2960b7f4d1418ded4bf32c07976c81aee9200e2e3c5eb  3 agree, 0 disagree, 2 idle  ERROR
+PASS  a close before the window ends is refused  - 3 agree, 0 disagree, 2 idle  [EXPECTED] the objection window of P2 is open for another 484 seconds
+GenLayer RPC error (eth_getTransactionCount): fetch failed
+      object was not taken (fetch failed); looking again in 20s
+GenLayer RPC error (eth_getTransactionCount): fetch failed
+      object was not taken (fetch failed); looking again in 20s
+      [10:43:23] P object(P2, Pay one translator 3 G, The beginner guide is ) +1 GEN  0xa6c5537974cd346abd58abfce3ecd9973b87beebed0d5495a5cc8f8930fe7278  3 agree, 0 disagree, 2 idle  SUCCESS
+PASS  the proposer cannot object, and the bond comes back  - 3 agree, 0 disagree, 2 idle  the proposer of P2 may not object to it
+GenLayer RPC error (eth_getTransactionCount): fetch failed
+      object was not taken (fetch failed); looking again in 20s
+      [10:47:13] B object(P2, Hand the whole fund to, Nobody should get the ) +0.5 GEN  0x04ff3579684e9acf66efc89637008b75e7ddf7db35b5da2e830a5b03f57c1212  3 agree, 0 disagree, 2 idle  SUCCESS
+PASS  half a bond is refused and comes back  - 3 agree, 0 disagree, 2 idle  send exactly the bond of 1000000000000000000 atto with an objection to P2; this call sent 500000000000000000
+      [10:48:01] B object(P2, Hand the whole fund to, Nobody should get the ) +1 GEN  0x61163d0c978cbe4fcd487068f4a46f6382fd8680be3ce7933e95e84525d1f9d4  3 agree, 0 disagree, 2 idle  SUCCESS
+PASS  the same strawman put to P2 is judged afresh, and is distorted again  - 3 agree, 0 disagree, 2 idle  distorted
+      [10:48:41] S object(P2,   HAND THE WHOLE FUND , Nobody should get the ) +1 GEN  0x61fa6aafb40fdfbd0fab9270c7cc7f20d59f95742d925ed47371f1a02385a4c6  5 agree, 0 disagree, 0 idle  SUCCESS
+PASS  S copies those words in other case and spacing: refused with no round, and the bond comes back  - 5 agree, 0 disagree, 0 idle  these words were already put as a restatement of P2 (O3); restate it in your own words
+
+[10:48:43] ---- 4: a stranger closes P1
+      [10:49:24] S close(P1)  0xb9549580a20e990206cb977f98c9f0679f260d39494714fd070fc3ed475c153f  3 agree, 0 disagree, 2 idle  SUCCESS
+PASS  S, who has no part in P1, closes it after the window: blocked  - 3 agree, 0 disagree, 2 idle  {"ok": true, "proposal": "P1", "status": "blocked", "faithful": 1, "threshold": 1, "value": "3000000000000000000", "paid
+PASS  the 3 GEN go back to the proposer and A's bond back to A, in the same call  - {"p":"3000000000000000000","a":"1000000000000000000","s":"0"}
+
+[10:49:24] ---- 5: P2's window runs out with no faithful objection
+      [10:50:09] P close(P2)  0xcf8a757da7c8e4971b85a35f4a0c9901aa3d4e0702ec99e7f10ab5146d6cf6be  3 agree, 0 disagree, 2 idle  SUCCESS
+PASS  P2 is closed: passed  - 3 agree, 0 disagree, 2 idle  {"ok": true, "proposal": "P2", "status": "passed", "faithful": 0, "threshold": 1, "value": "3000000000000000000", "paid_
+PASS  and the 3 GEN reach the recipient, which holds no key and signed nothing  - {"r":"3000000000000000000","p":"0"}
+
+[10:50:10] ---- 6: the views, the code, and the money
+PASS  proposal(P1).status is blocked and proposal(P2).status is passed  - {"P1":"blocked","P2":"passed"}
+PASS  objections_of(P1): the strawman and the faithful restatement, both judged  - {"proposal":"P1","count":2,"ids":["O1","O2"]}
+PASS  objection(A): faithful, the reason stored as written, the bond released at close  - {"verdict":"faithful","held":"0"}
+PASS  objection(B): distorted, the bond paid to the proposer  - {"verdict":"distorted","to_proposer":"1000000000000000000"}
+PASS  standing(P2, B): one judged attempt used, two left, nothing counted  - {"proposal":"P2","who":"0x916340d472e62a5c7dfb027a8201e3257e3258d6","is_proposer":false,"attempts_used":1,"attempts_left":2,"counted":"","may_object":false,"bond":"1000000000000000000"}
+PASS  stats(): two proposals, one blocked, one passed, nothing held  - {"proposals":2,"open":0,"blocked":1,"passed":1,"objections":3,"faithful":1,"distorted":2,"unclear":0,"refused":4,"value_held":"0","bonds_held":"0","fined_total":"2000000000000000000","balance_owed":"0"}
+PASS  the contract's own balance is zero  - 0
+PASS  rules(): the agreement rule in words, with the limits  - value,askings,combine,compared,not_asked,money,who,limits,untrusted
+PASS  the code deployed at 0x6a4dc84a990e6117A137c8580FbaDfDB76f56A02 is byte for byte contracts/steelman.py  - 38604 bytes, sha256 29eb6d369381777821c8469b140ee7fa67bfbaa9992ead8b09ca6dca99f737ec
+PASS  over the run every account ends exactly where the receipts say  - P -1 (receipts -1)  A 0 (receipts 0)  B -2 (receipts -2)  S 0 (receipts 0)  R 3 (receipts 3)
+
+27 passed, 0 failed
+Steelman: 0x6a4dc84a990e6117A137c8580FbaDfDB76f56A02
+transactions: 13 in 13 steps; sent a second time: none
+strawmanP1     0xe9c0f15cf7e3a8d5ced016d428d998b6ecd104a8b8199a507065c84b8bf9715b 3 agree, 0 disagree, 2 idle  distorted O1
+faithfulP1     0xf639467a20a4bcc201682f8e61fc1a532bb3dac6c5a2582cd544b438e0176983 3 agree, 0 disagree, 2 idle  faithful O2
+strawmanP2     0x61163d0c978cbe4fcd487068f4a46f6382fd8680be3ce7933e95e84525d1f9d4 3 agree, 0 disagree, 2 idle  distorted O3
+
