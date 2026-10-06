@@ -112,7 +112,7 @@ money.
 
 - **The threshold counts addresses, not people.** Anyone willing to write
   several different faithful restatements from several addresses can reach it.
-  Blocking costs gas and the bonds held for the window, which all come back. Use
+  Blocking costs only the bonds held for the window, which all come back. Use
   it where the objectors are a known group, or put a membership check in front.
 - **Faithful is not the same as understood.** A restatement that copies most of
   the proposal's own words would be read as faithful. The contract refuses a word
