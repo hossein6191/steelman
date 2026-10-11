@@ -11,7 +11,8 @@ restatement of the proposal and nothing else. It never reads the objector's
 reason and never decides who is right. Enough faithful objections block the
 proposal and the money goes back to the proposer; otherwise it passes and the
 money goes to the recipient. A strawman costs its author the bond, paid to the
-proposer.
+proposer. Once a proposal has its threshold of faithful objections it takes no
+more, so settling it is bounded: at most five held bonds and six transfers.
 
 ## Consensus
 
@@ -101,18 +102,38 @@ contract's balance after every call.
 | method | kind | what it does |
 |---|---|---|
 | `propose(title, text, recipient, window_seconds, threshold, bond_atto)` | payable write | locks the value behind a new proposal; every refusal returns the value |
-| `object(proposal, restatement, reason)` | payable write | checks the door with no model, then runs the round and settles the bond by the stored word; every refusal returns the value |
-| `close(proposal)` | write | after the window: blocked or passed, the value to the proposer or the recipient, every held bond back; refusals raise `[EXPECTED]` |
-| `proposal(proposal_id)` | view | the whole proposal, with `status`, `window_open`, `closable` and `would_be` |
+| `object(proposal, restatement, reason)` | payable write | checks the door with no model, then runs the round and settles the bond by the stored word; every refusal returns the value. Refuses, with no model asked, once the proposal's faithful objections have reached its threshold; below it, any number of objections is judged |
+| `close(proposal)` | write | after the window: blocked or passed, the value to the proposer or the recipient, every held bond back, at most 1 + 5 transfers; refusals raise `[EXPECTED]` |
+| `proposal(proposal_id)` | view | the whole proposal, with `status`, `window_open`, `closable`, `would_be`, `taking_objections` and `taking_objections_why`, and `max_held_bonds` (its threshold) |
 | `objection(objection_id)` | view | one objection, with its restatement, its reason, the stored word and where the bond went |
-| `objections_of(proposal_id)` | view | the ids of every judged objection to one proposal, in order |
+| `objections_of(proposal_id, offset, limit)` | view | a page of at most 20 ids of the judged objections to one proposal, in the order judged, with `total` |
 | `proposals(offset, limit)` | view | a page of at most 20 proposal summaries, oldest first |
 | `standing(proposal_id, who)` | view | what one address may still do on one proposal: attempts used and left, its counted objection, whether it may object now |
 | `stats()` | view | counts, `value_held`, `bonds_held`, `fined_total` and `balance_owed` |
-| `rules()` | view | the askings, the combine table, what is compared, the money, who may do what, and every limit |
+| `rules()` | view | the askings, the combine table, what is compared, the money, the settlement bound, who may do what, and every limit, `max_held_bonds` among them |
 
 Every view takes ids, small integers or an address, never free text: a Studio
 read fails once the encoded call passes 256 bytes.
+
+## Bounds
+
+Settlement work per proposal has a ceiling, and so does every other loop.
+
+| constant | value | what it bounds |
+|---|---|---|
+| `MAX_HELD_BONDS` | `MAX_THRESHOLD`, 5 | bonds held per proposal: `object()` takes no objection once the faithful ones reach the threshold, so `close()` reads at most 5 rows and makes at most 1 + 5 transfers |
+| `PAGE_CAP` | 20 | rows per page of `proposals()` and of `objections_of()` |
+
+`close()` loops over `held_count = min(faithful, threshold, MAX_HELD_BONDS)` and
+refuses, whole, a state in which `held_count` differs from `faithful`, which
+`object()` cannot write. The only other loops read the characters of one
+argument once it is inside its length cap, or the parts of the message clock.
+A static test fails on any loop outside those shapes.
+
+The number of judged objections on a proposal is not capped. Storing one is a
+constant amount of work (one row in each TreeMap), and the list is read a page
+at a time. A cap would be a door anyone could fill with strawmen or vague
+restatements from a handful of addresses, after which nobody could object.
 
 ## Reuse
 
@@ -134,5 +155,5 @@ smoothed away, and could gate a reply, a review or a summary in the same way.
   objector as `unclear` rounds, softened by the returned bond and three attempts.
 - A Studio transaction's clock is the message `datetime`; a transaction with no
   readable clock is refused, never guessed.
-- `close` iterates the faithful objections of one proposal; the number of
-  addresses that may object is not capped.
+- An objection after the threshold is refused, so its restatement and reason
+  are not recorded; the outcome is already blocked.

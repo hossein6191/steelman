@@ -24,6 +24,14 @@ reached the threshold the proposal is blocked and its value goes back to the
 proposer; otherwise it passes and the value goes to the recipient. Every held
 bond goes back to its objector in the same call.
 
+Settlement is bounded. Once a proposal's faithful objections reach its
+threshold its outcome is decided, so object() takes no further objection on it:
+the bond comes straight back and no model is asked. A proposal therefore holds
+at most `threshold` (at most MAX_HELD_BONDS, 5) bonds, and close() makes at most
+1 + 5 transfers however many people wanted to object. The number of judged
+objections is not capped: each is stored in O(1), and objections_of() reads them
+a page of at most PAGE_CAP (20) at a time, like proposals().
+
 proposal(id).status is the reusable part: an answer, reached under consensus,
 to "did this spend survive the people who understood it and still objected".
 """
@@ -49,7 +57,8 @@ MIN_THRESHOLD, MAX_THRESHOLD = 1, 5
 MIN_BOND, MAX_BOND = GEN // 100, 10 * GEN
 MIN_VALUE, MAX_VALUE = GEN // 10, 1000 * GEN
 MAX_ATTEMPTS = 3                  # judged restatements per address per proposal
-PAGE_CAP = 20                     # proposals per page of the list view
+MAX_HELD_BONDS = MAX_THRESHOLD    # held bonds per proposal, at most: no objection is taken past the threshold
+PAGE_CAP = 20                     # rows per page of the list views, proposals() and objections_of()
 TAG_CHARS = 16                    # hex characters of a block's own sha256 on its delimiter lines
 
 ZERO = "0x0000000000000000000000000000000000000000"
@@ -450,6 +459,26 @@ class Objection:
     released_at: u64
 
 
+# ------------------------------------------------------------------- bound
+
+def _no_more_objections(pid: str, p: typing.Any) -> str:
+    """"" while a proposal's counts still let it take an objection, else why not. Asks nobody anything.
+
+    Once the faithful objections reach the threshold the outcome is decided:
+    the proposal will be blocked at close whatever else is said, so refusing
+    the rest loses nothing, and no proposal ever holds more than `threshold`
+    (at most MAX_HELD_BONDS) bonds. Nothing else closes the door: a cap on the
+    number of judged objections would be a door anyone could fill with
+    strawmen or vague restatements before the people who understood the
+    proposal arrived.
+    """
+    faithful = int(p.faithful)
+    if faithful >= int(p.threshold):
+        return (pid + " already has " + str(faithful) + " faithful objection" + ("" if faithful == 1 else "s")
+                + ", its threshold: it will be blocked at close, so no further objection is taken")
+    return ""
+
+
 class Steelman(gl.Contract):
     proposal_rows: TreeMap[str, Proposal]
     objection_rows: TreeMap[str, Objection]
@@ -549,6 +578,11 @@ class Steelman(gl.Contract):
         One consensus block asks whether the restatement is faithful, in both
         framings; the reason is stored and never shown to the model. Every
         refusal returns the value sent and asks nobody anything.
+
+        Once the faithful objections reach the threshold the outcome is decided
+        and nothing more is taken: that is what keeps close() bounded. Below
+        the threshold every objection that passes the door is judged, however
+        many came before it.
         """
         value = int(gl.message.value)
         sender = gl.message.sender_address
@@ -560,6 +594,7 @@ class Steelman(gl.Contract):
         now = _now()
         key = pid + ":" + me
         used = self._attempts(key)
+        full = _no_more_objections(pid, p)
         problem = ""
         if me == _low(p.proposer):
             problem = "the proposer of " + pid + " may not object to it"
@@ -570,6 +605,8 @@ class Steelman(gl.Contract):
         elif now >= int(p.closes_at):
             problem = ("the objection window of " + pid + " closed at " + str(int(p.closes_at))
                        + "; anybody may close it now")
+        elif full:
+            problem = full + "; your bond was returned"
         elif key in self.counted_rows:
             problem = ("this address already has a counted objection on " + pid + " (" + str(self.counted_rows[key])
                        + "); one counted objection per address")
@@ -646,6 +683,13 @@ class Steelman(gl.Contract):
         Not payable, so a refusal raises: nothing was taken. Blocked sends the
         value back to the proposer, passed sends it to the recipient, and every
         held bond goes back to its objector, all in this call.
+
+        The work is bounded. object() takes no objection once the faithful ones
+        reach the threshold, so a proposal holds at most `threshold` bonds, and
+        the threshold is at most MAX_HELD_BONDS (5): this call reads at most 5
+        rows and makes at most 1 + 5 transfers, however many people objected.
+        The loop runs over min(faithful, threshold, MAX_HELD_BONDS), and a state
+        that broke the bound is refused whole rather than settled in part.
         """
         pid = proposal.strip() if isinstance(proposal, str) else ""
         if pid not in self.proposal_rows:
@@ -659,9 +703,13 @@ class Steelman(gl.Contract):
                   + " seconds")
         blocked = int(p.faithful) >= int(p.threshold)
         value = int(p.value)
+        held_count = min(int(p.faithful), int(p.threshold), MAX_HELD_BONDS)
+        if held_count != int(p.faithful):
+            _fail(pid + " holds " + str(int(p.faithful)) + " faithful bonds, more than its threshold of "
+                  + str(int(p.threshold)) + " lets it hold; it is not settled in part")
         refunds = []
-        for k in range(1, int(p.faithful) + 1):
-            oid = str(self.held_rows[pid + ":" + str(k)])
+        for i in range(held_count):
+            oid = str(self.held_rows[pid + ":" + str(i + 1)])
             o = self.objection_rows[oid]
             if int(o.held) > 0:
                 refunds.append((o.objector, int(o.held)))
@@ -699,6 +747,21 @@ class Steelman(gl.Contract):
         p = self.proposal_rows[pid]
         now = _now()
         is_open = str(p.status) == OPEN
+        stop = _no_more_objections(pid, p)
+        if not is_open:
+            why = pid + " is " + str(p.status) + " and takes no objections"
+        elif now < 0:
+            why = "no readable clock on this read; the window cannot be measured"
+        elif now >= int(p.closes_at):
+            why = "the objection window closed at " + str(int(p.closes_at)) + "; anybody may close it now"
+        elif stop:
+            why = stop
+        else:
+            why = ""
+        taking = why == ""
+        if taking:
+            why = ("the window is open until " + str(int(p.closes_at)) + ": " + str(int(p.faithful)) + " of "
+                   + str(int(p.threshold)) + " faithful objections, " + str(int(p.judged)) + " judged so far")
         return json.dumps({
             "proposal": pid, "status": str(p.status), "title": str(p.title), "text": str(p.text),
             "proposer": _low(p.proposer), "recipient": _low(p.recipient), "value": str(int(p.value)),
@@ -709,6 +772,8 @@ class Steelman(gl.Contract):
             "faithful": int(p.faithful), "distorted": int(p.distorted), "unclear": int(p.unclear),
             "judged": int(p.judged), "held": str(int(p.held)), "fined": str(int(p.fined)),
             "would_be": BLOCKED if int(p.faithful) >= int(p.threshold) else PASSED,
+            "taking_objections": taking, "taking_objections_why": why,
+            "max_held_bonds": int(p.threshold),
             "closed_at": int(p.closed_at), "closed_by": _low(p.closed_by) if int(p.closed_at) else "",
             "paid_to": str(p.paid_to),
         })
@@ -729,14 +794,23 @@ class Steelman(gl.Contract):
         })
 
     @gl.public.view
-    def objections_of(self, proposal_id: str) -> str:
-        """The ids of every judged objection to one proposal, in the order they were judged."""
+    def objections_of(self, proposal_id: str, offset: int, limit: int) -> str:
+        """One page of the judged objections to one proposal, in the order they were judged.
+
+        Like proposals(): `limit` is at most 20, so a reply always has a size
+        however many objections were judged, and `total` says how many there are.
+        """
         pid = proposal_id.strip() if isinstance(proposal_id, str) else ""
         if pid not in self.proposal_rows:
             return json.dumps({"error": "no proposal " + pid[:12]})
-        n = int(self.proposal_rows[pid].judged)
-        return json.dumps({"proposal": pid, "count": n,
-                           "ids": [str(self.index_rows[pid + ":" + str(k)]) for k in range(1, n + 1)]})
+        total = int(self.proposal_rows[pid].judged)
+        start = max(_whole(offset), 0)
+        size = min(max(_whole(limit), 1), PAGE_CAP)
+        count = min(max(total - start, 0), size, PAGE_CAP)
+        ids = []
+        for i in range(count):
+            ids.append(str(self.index_rows[pid + ":" + str(start + 1 + i)]))
+        return json.dumps({"proposal": pid, "total": total, "offset": start, "limit": size, "ids": ids})
 
     @gl.public.view
     def proposals(self, offset: int, limit: int) -> str:
@@ -744,9 +818,10 @@ class Steelman(gl.Contract):
         n = int(self.proposal_count)
         start = max(_whole(offset), 0)
         size = min(max(_whole(limit), 1), PAGE_CAP)
+        count = min(max(n - start, 0), size, PAGE_CAP)
         rows = []
-        for k in range(start + 1, min(n, start + size) + 1):
-            pid = "P" + str(k)
+        for i in range(count):
+            pid = "P" + str(start + 1 + i)
             p = self.proposal_rows[pid]
             rows.append({"proposal": pid, "title": str(p.title), "status": str(p.status),
                          "value": str(int(p.value)), "faithful": int(p.faithful), "threshold": int(p.threshold),
@@ -766,7 +841,7 @@ class Steelman(gl.Contract):
         counted = str(self.counted_rows[key]) if key in self.counted_rows else ""
         now = _now()
         may = (str(p.status) == OPEN and 0 <= now < int(p.closes_at) and addr != _low(p.proposer)
-               and not counted and used < MAX_ATTEMPTS)
+               and not counted and used < MAX_ATTEMPTS and not _no_more_objections(pid, p))
         return json.dumps({"proposal": pid, "who": addr[:42], "is_proposer": addr == _low(p.proposer),
                            "attempts_used": used, "attempts_left": 0 if counted else max(MAX_ATTEMPTS - used, 0),
                            "counted": counted, "may_object": may, "bond": str(int(p.bond))})
@@ -804,19 +879,28 @@ class Steelman(gl.Contract):
                           "once. unclear: back at once",
                 "close": "anyone, after the window. blocked when faithful objections reach the threshold: the "
                          "value goes back to the proposer; otherwise passed: the value goes to the recipient. "
-                         "Every held bond goes back to its objector in the same call",
+                         "Every held bond goes back to its objector in the same call: at most the threshold's "
+                         "worth, " + str(MAX_HELD_BONDS) + " at most, so a close makes at most "
+                         + str(1 + MAX_HELD_BONDS) + " transfers",
                 "refusals": "every refused payable call returns everything it sent",
             },
+            "settlement": "bounded. object() takes no objection once a proposal's faithful objections reach its "
+                          "threshold (the outcome is decided: it will be blocked), so a proposal holds at most "
+                          "threshold <= " + str(MAX_HELD_BONDS) + " bonds and close() pays at most 1 + "
+                          + str(MAX_HELD_BONDS) + " transfers. The number of judged objections is not capped, "
+                          "so nobody can fill a proposal and shut out its objectors; objections_of() and "
+                          "proposals() page at " + str(PAGE_CAP),
             "who": {"propose": "anyone; the recipient is somebody else",
                     "object": "anyone but the proposer, during the window; one counted objection and at most "
                               + str(MAX_ATTEMPTS) + " judged attempts per address per proposal; never the same "
-                              "words twice on one proposal",
+                              "words twice on one proposal; none once the faithful objections reach the "
+                              "threshold",
                     "close": "anyone, once the window has passed"},
             "limits": {"title": [MIN_TITLE, MAX_TITLE], "text": [MIN_TEXT, MAX_TEXT],
                        "restatement": [MIN_RESTATEMENT, MAX_RESTATEMENT], "reason": [MIN_REASON, MAX_REASON],
                        "window_seconds": [MIN_WINDOW, MAX_WINDOW], "threshold": [MIN_THRESHOLD, MAX_THRESHOLD],
                        "bond_atto": [str(MIN_BOND), str(MAX_BOND)], "value_atto": [str(MIN_VALUE), str(MAX_VALUE)],
-                       "attempts": MAX_ATTEMPTS, "page": PAGE_CAP},
+                       "attempts": MAX_ATTEMPTS, "page": PAGE_CAP, "max_held_bonds": MAX_HELD_BONDS},
             "untrusted": "the proposal and the restatement are printable ASCII on one line, fenced (< and > "
                          "replaced, never deleted) and placed between delimiter lines tagged with the sha256 of "
                          "their own fenced text; the prompt says, before the blocks, that both are untrusted",

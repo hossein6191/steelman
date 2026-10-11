@@ -7,6 +7,7 @@ clean on any machine with no network.
 """
 
 import ast
+import dataclasses
 import datetime as dt
 import hashlib
 import importlib.util
@@ -146,6 +147,17 @@ def _balance():
     return BANK["in"] - sum(v for _, v, _ in TRANSFERS)
 
 
+def _snapshot(c):
+    """Everything the contract stores, as plain values, so a refusal can be shown to have written nothing."""
+    rows = {}
+    for name in ("proposal_rows", "objection_rows", "index_rows", "held_rows", "attempt_rows", "counted_rows",
+                 "digest_rows"):
+        rows[name] = {k: (dataclasses.asdict(v) if dataclasses.is_dataclass(v) else v)
+                      for k, v in getattr(c, name).items()}
+    counters = {k: int(getattr(c, k)) for k in sm.Steelman.__annotations__ if not k.endswith("_rows")}
+    return rows, counters
+
+
 def _send(c, fn, *args, by, value=0, second=0):
     """A call with its value counted in, so the money table can be checked against the contract's books."""
     _as(by, value, second)
@@ -175,6 +187,10 @@ VAGUE = "Something about paying for translations of some documents at some point
 REASON_A = ("The beginner guide is being rewritten next month, so translating the current version now pays for "
             "text that is about to be replaced.")
 REASON_B = "Nobody should get the whole fund for a translation job; the money is needed for hosting."
+OTHER_FAITHFUL = ("Use 3 GEN of the community fund to have a single translator put the twelve-page beginner guide "
+                  "into Spanish and Portuguese, paying only after both are on the documentation site; nothing else "
+                  "in the fund is spent.")
+REASON_S = "Machine translation of a guide this short is good enough and costs nothing at all."
 
 
 # ------------------------------------------------------ scripted models
@@ -811,19 +827,120 @@ class TestClose:
         LATCH["check"] = None
 
 
+# ==================================================================== bound
+
+class TestBound:
+    """Settlement work per proposal has a ceiling: the reviewer's finding, and the fix."""
+
+    def test_once_the_threshold_is_reached_no_further_objection_is_taken(self):
+        c = _fresh()
+        pid = _proposed(c)                                        # threshold 1
+        assert _objected(c, pid, FAITHFUL_WORDS, "faithful", A)["counted"] is True
+        n0 = len(TRANSFERS)
+        before = _snapshot(c)
+        out = _objected(c, pid, OTHER_FAITHFUL, "faithful", S, reason=REASON_S, second=20)
+        assert out == {"ok": False, "returned": str(BOND),
+                       "reason": "P1 already has 1 faithful objection, its threshold: it will be blocked at close, "
+                                 "so no further objection is taken; your bond was returned"}
+        assert CALLS == [] and _sent()[n0:] == [(S, BOND)]        # no model asked; the bond back in the same call
+        rows, counters = before
+        counters["refusal_count"] += 1
+        assert _snapshot(c) == (rows, counters)                   # nothing stored but the refusal counter
+        assert _balance() == VALUE + BOND
+
+    def test_a_strawman_after_the_threshold_is_refused_not_fined(self):
+        c = _fresh()
+        pid = _proposed(c, threshold=3)
+        for k, who in enumerate((A, B, S)):
+            assert _objected(c, pid, FAITHFUL_WORDS + " Note %d." % k, "faithful", who, second=10 + k)["counted"]
+        late = "0x" + "77" * 20
+        n0 = len(TRANSFERS)
+        out = _objected(c, pid, STRAWMAN, "distorted", late, reason=REASON_B, second=20)
+        assert out["ok"] is False and "P1 already has 3 faithful objections, its threshold" in out["reason"]
+        assert CALLS == [] and _sent()[n0:] == [(late, BOND)] and json.loads(c.proposal(pid))["fined"] == "0"
+
+    def test_below_the_threshold_objections_are_still_taken(self):
+        c = _fresh()
+        pid = _proposed(c, threshold=2)
+        assert _objected(c, pid, FAITHFUL_WORDS, "faithful", A)["counted"] is True
+        assert _objected(c, pid, STRAWMAN, "distorted", B, second=11)["verdict"] == "distorted"
+        assert _objected(c, pid, OTHER_FAITHFUL, "faithful", S, second=12)["counted"] is True
+        out = _objected(c, pid, VAGUE, "unclear", "0x" + "77" * 20, second=13)
+        assert out["ok"] is False and "already has 2 faithful objections" in out["reason"]
+
+    @pytest.mark.parametrize("need", [1, 3, 5])
+    def test_close_after_the_threshold_pays_exactly_threshold_bonds(self, need):
+        c = _fresh()
+        pid = _proposed(c, threshold=need)
+        people = ["0x%040x" % (k + 1) for k in range(need + 3)]
+        for k, who in enumerate(people):
+            out = _objected(c, pid, FAITHFUL_WORDS + " Note %d." % k, "faithful", who, second=10 + k)
+            assert out["ok"] is (k < need), (k, out)
+        assert int(c.proposal_rows[pid].faithful) == need and json.loads(c.stats())["bonds_held"] == str(need * BOND)
+        n0 = len(TRANSFERS)
+        out = _send(c, "close", pid, by=S, second=WINDOW)
+        assert out["status"] == "blocked" and out["objectors_repaid"] == need
+        assert out["bonds_returned"] == str(need * BOND)
+        assert _sent()[n0:] == [(P, VALUE)] + [(w, BOND) for w in people[:need]]
+        assert len(TRANSFERS) - n0 == 1 + need <= 1 + sm.MAX_HELD_BONDS
+        assert _balance() == 0 and json.loads(c.stats())["balance_owed"] == "0"
+
+    def test_close_refuses_a_state_that_broke_the_bound_rather_than_settle_part_of_it(self):
+        c = _fresh()
+        pid = _proposed(c)
+        _objected(c, pid, FAITHFUL_WORDS, "faithful", A)
+        c.proposal_rows[pid].faithful = 2                         # a state object() can never write
+        n0 = len(TRANSFERS)
+        _as(S, 0, WINDOW)
+        with pytest.raises(UserError) as e:
+            c.close(pid)
+        assert e.value.message.startswith("[EXPECTED] P1 holds 2 faithful bonds, more than its threshold of 1")
+        assert len(TRANSFERS) == n0 and c.proposal_rows[pid].status == "open"
+
+    def test_the_proposal_says_whether_it_takes_objections_and_why(self):
+        c = _fresh()
+        pid = _proposed(c, threshold=2)
+        _as(S, 0, 10)
+        row = json.loads(c.proposal(pid))
+        assert row["taking_objections"] is True and row["max_held_bonds"] == 2
+        assert "0 of 2 faithful objections, 0 judged so far" in row["taking_objections_why"]
+        _objected(c, pid, FAITHFUL_WORDS, "faithful", A)
+        _objected(c, pid, OTHER_FAITHFUL, "faithful", B, second=11)
+        _as(S, 0, 12)
+        row = json.loads(c.proposal(pid))
+        assert row["taking_objections"] is False and row["would_be"] == "blocked"
+        assert row["taking_objections_why"].startswith("P1 already has 2 faithful objections, its threshold")
+        assert json.loads(c.standing(pid, S))["may_object"] is False
+        _as(S, 0, WINDOW)
+        assert "anybody may close it now" in json.loads(c.proposal(pid))["taking_objections_why"]
+        _send(c, "close", pid, by=S, second=WINDOW)
+        row = json.loads(c.proposal(pid))
+        assert row["taking_objections"] is False and row["taking_objections_why"] == "P1 is blocked and takes no objections"
+
+    def test_a_view_with_no_clock_says_it_cannot_measure_the_window(self):
+        c = _fresh()
+        pid = _proposed(c)
+        _as(S, 0, 10, clock=False)
+        row = json.loads(c.proposal(pid))
+        assert row["taking_objections"] is False and "no readable clock" in row["taking_objections_why"]
+
+
 # ================================================================= journeys
 
 class TestJourneys:
     def test_the_demo_end_to_end(self):
-        """The on-chain run, offline: P1 is blocked by one faithful objection, P2 passes."""
+        """The on-chain run, offline: P1 is blocked by one faithful objection and takes no more, P2 passes."""
         c = _fresh()
         _net(reader())
         out = _send(c, "propose", TITLE, TEXT, R, 60, 1, str(BOND), by=P, value=VALUE, second=0)
         assert out["ok"] is False and out["returned"] == str(VALUE)
-        p1 = _proposed(c, second=5)
+        p1 = _proposed(c, window=600, second=5)
         b1 = _send(c, "object", p1, STRAWMAN, REASON_B, by=B, value=BOND, second=30)
         a1 = _send(c, "object", p1, FAITHFUL_WORDS, REASON_A, by=A, value=BOND, second=60)
         assert b1["verdict"] == "distorted" and a1["verdict"] == "faithful"
+        late = _send(c, "object", p1, OTHER_FAITHFUL, REASON_S, by=S, value=BOND, second=70)
+        assert late["ok"] is False and "P1 already has 1 faithful objection, its threshold" in late["reason"]
+        assert late["returned"] == str(BOND) and _sent()[-1] == (S, BOND)
         p2 = _proposed(c, title=TITLE2, text=TEXT2, window=900, second=120)
         assert _send(c, "close", p2, by=S, second=130)["raised"].startswith("[EXPECTED] the objection window of P2")
         assert "the proposer of P2 may not object" in _send(c, "object", p2, FAITHFUL_WORDS, REASON_A, by=P,
@@ -834,18 +951,46 @@ class TestJourneys:
         assert b2["verdict"] == "distorted"
         copy = _send(c, "object", p2, "  " + STRAWMAN.upper() + "  ", REASON_B, by=S, value=BOND, second=170)
         assert "restate it in your own words" in copy["reason"]
-        closed1 = _send(c, "close", p1, by=S, second=5 + WINDOW)
+        closed1 = _send(c, "close", p1, by=S, second=5 + 600)
         assert closed1["status"] == "blocked" and closed1["bonds_returned"] == str(BOND)
         closed2 = _send(c, "close", p2, by=P, second=120 + 900)
         assert closed2["status"] == "passed" and closed2["to"] == R
         net = {}
         for to, v, _ in TRANSFERS:
             net[to] = net.get(to, 0) + v
-        # P: the refused proposal, two strawman bonds, its own refused objection, and P1's value back
+        # P: the refused proposal, two strawman bonds, its own refused objection, and P1's value back;
+        # S: the late objection on P1 and the copied words on P2, both refused and returned
         assert net[R] == VALUE and net[A] == BOND and net[P] == 2 * VALUE + 3 * BOND
-        assert net[B] == BOND // 2 and net[S] == BOND
+        assert net[B] == BOND // 2 and net[S] == 2 * BOND
         assert _balance() == 0 and json.loads(c.stats())["balance_owed"] == "0"
-        assert json.loads(c.objections_of(p1))["ids"] == [b1["objection"], a1["objection"]]
+        assert json.loads(c.objections_of(p1, 0, 20))["ids"] == [b1["objection"], a1["objection"]]
+
+    def test_any_number_of_judged_objections_cannot_shut_out_a_real_objector(self):
+        """45 strawmen and vague lines from 15 of the proposer's own addresses first; A still blocks it."""
+        c = _fresh()
+        pid = _proposed(c, threshold=1)
+        puppets = ["0x%040x" % (k + 1) for k in range(15)]       # three judged attempts each
+        for k in range(45):
+            if k % 2:
+                out = _objected(c, pid, STRAWMAN + " Take %d." % k, "distorted", puppets[k // 3], reason=REASON_B,
+                                second=10 + k)
+            else:
+                out = _objected(c, pid, VAGUE + " Take %d." % k, "unclear", puppets[k // 3], second=10 + k)
+            assert out["ok"] is True and out["counted"] is False, (k, out)
+        assert sum(v for to, v in _sent() if to == P) == 22 * BOND  # the strawmen cost the proposer's side nothing
+        _as(S, 0, 59)
+        row = json.loads(c.proposal(pid))
+        assert row["judged"] == 45 and row["taking_objections"] is True and row["would_be"] == "passed"
+        assert json.loads(c.standing(pid, A))["may_object"] is True
+        a = _objected(c, pid, FAITHFUL_WORDS, "faithful", A, second=60)
+        assert a["ok"] is True and a["verdict"] == "faithful" and a["counted"] is True and a["objection"] == "O46"
+        assert json.loads(c.proposal(pid))["judged"] == 46
+        listed = json.loads(c.objections_of(pid, 40, 20))
+        assert listed["total"] == 46 and listed["ids"] == ["O%d" % k for k in range(41, 47)]
+        n0 = len(TRANSFERS)
+        closed = _send(c, "close", pid, by=S, second=WINDOW)
+        assert closed["status"] == "blocked" and closed["objectors_repaid"] == 1
+        assert _sent()[n0:] == [(P, VALUE), (A, BOND)] and _balance() == 0
 
     def test_a_strawman_objector_has_a_route_out_restate_it_faithfully(self):
         c = _fresh()
@@ -886,8 +1031,10 @@ class TestJourneys:
         assert json.loads(c.proposal(pid))["window_open"] is False
 
     def test_the_money_table_holds_after_every_step_of_random_journeys(self):
+        """And the settlement bound: no proposal ever holds more bonds than its threshold."""
         rnd = random.Random(61999)
-        people = [P, A, B, S, "0x" + "77" * 20]
+        people = [P, A, B, S, "0x" + "77" * 20, "0x" + "88" * 20]
+        past_threshold = 0
         for trial in range(40):
             c = _fresh()
             t = 0
@@ -904,8 +1051,9 @@ class TestJourneys:
                 elif what == "object":
                     _net(judge(rnd.choice(["faithful", "distorted", "unclear"])))
                     bond = int(c.proposal_rows[pid].bond) if pid in c.proposal_rows else BOND
-                    _send(c, "object", pid, FAITHFUL_WORDS + " Variant %d." % rnd.randint(0, 6), REASON_A,
-                          by=who, value=rnd.choice([bond, bond, bond, bond + 1]), second=t)
+                    out = _send(c, "object", pid, FAITHFUL_WORDS + " Variant %d." % rnd.randint(0, 6), REASON_A,
+                                by=who, value=rnd.choice([bond, bond, bond, bond + 1]), second=t)
+                    past_threshold += "its threshold: it will be blocked at close" in str(out.get("reason", ""))
                 else:
                     _send(c, "close", pid, by=who, second=t)
                 owed = sum(int(p.value) + int(p.held) for p in c.proposal_rows.values() if p.status == "open")
@@ -913,15 +1061,19 @@ class TestJourneys:
                 stats = json.loads(c.stats())
                 assert _balance() == owed == int(stats["balance_owed"]), (trial, step, what)
                 assert held == int(stats["bonds_held"]) and _balance() >= 0
-                for p in c.proposal_rows.values():
-                    assert int(p.faithful) <= int(p.judged)
+                for p_id, p in c.proposal_rows.items():
+                    assert int(p.faithful) <= int(p.judged) == json.loads(c.objections_of(p_id, 0, 20))["total"]
+                    holding = [o for o in c.objection_rows.values() if o.proposal == p_id and int(o.held) > 0]
+                    assert len(holding) <= int(p.threshold) <= sm.MAX_HELD_BONDS, (trial, step, p_id)
+                    assert int(p.faithful) <= int(p.threshold)
                     if p.status == "open":
-                        assert int(p.held) == int(p.faithful) * int(p.bond)
+                        assert int(p.held) == int(p.faithful) * int(p.bond) == len(holding) * int(p.bond)
                     else:
-                        assert int(p.held) == 0
+                        assert int(p.held) == 0 and not holding
             for p_id in list(c.proposal_rows):
                 _send(c, "close", p_id, by=S, second=t + 10 ** 7)
             assert _balance() == 0 and json.loads(c.stats())["open"] == 0, trial
+        assert past_threshold > 0          # the journeys did reach the bound, and were turned away at it
 
 
 # ==================================================================== views
@@ -945,8 +1097,30 @@ class TestViews:
         _objected(c, pid, VAGUE, "unclear", S, second=11)
         _objected(c, pid, FAITHFUL_WORDS, "faithful", A, second=12)
         _objected(c, pid, STRAWMAN, "faithful", S, second=13)            # refused, never listed
-        assert json.loads(c.objections_of(pid)) == {"proposal": "P1", "count": 3, "ids": ["O1", "O2", "O3"]}
-        assert json.loads(c.objections_of("P5"))["error"] == "no proposal P5"
+        assert json.loads(c.objections_of(pid, 0, 20)) == {"proposal": "P1", "total": 3, "offset": 0, "limit": 20,
+                                                           "ids": ["O1", "O2", "O3"]}
+        assert json.loads(c.objections_of("P5", 0, 20))["error"] == "no proposal P5"
+
+    def test_a_page_of_objections(self):
+        c = _fresh()
+        pid = _proposed(c, threshold=5)
+        people = ["0x%040x" % (k + 1) for k in range(8)]
+        for k in range(23):
+            assert _objected(c, pid, VAGUE + " Take %d." % k, "unclear", people[k // 3], second=10 + k)["ok"]
+        first = json.loads(c.objections_of(pid, 0, 50))                 # a limit over 20 is read as 20
+        assert first == {"proposal": "P1", "total": 23, "offset": 0, "limit": 20,
+                         "ids": ["O%d" % k for k in range(1, 21)]}
+        last = json.loads(c.objections_of(pid, 20, 20))                 # the last page is short
+        assert last["ids"] == ["O21", "O22", "O23"] and last["total"] == 23 and last["offset"] == 20
+        assert json.loads(c.objections_of(pid, 22, 1))["ids"] == ["O23"]
+        assert json.loads(c.objections_of(pid, "5", "2"))["ids"] == ["O6", "O7"]
+        for offset in (23, 99):                                         # past the end: an empty page
+            empty = json.loads(c.objections_of(pid, offset, 5))
+            assert empty == {"proposal": "P1", "total": 23, "offset": offset, "limit": 5, "ids": []}
+        assert json.loads(c.objections_of(pid, -3, "x"))["ids"] == ["O1"]   # unreadable: offset 0, limit 1
+        other = _proposed(c, second=40)
+        assert json.loads(c.objections_of(other, 0, 20)) == {"proposal": "P2", "total": 0, "offset": 0, "limit": 20,
+                                                             "ids": []}
 
     def test_standing_says_what_an_address_may_still_do(self):
         c = _fresh()
@@ -980,6 +1154,14 @@ class TestViews:
         assert rules["limits"]["text"] == [80, 1200] and rules["limits"]["restatement"] == [40, 400]
         assert rules["limits"]["reason"] == [20, 600] and rules["limits"]["window_seconds"] == [300, 14 * 86400]
         assert rules["limits"]["threshold"] == [1, 5]
+        assert rules["limits"]["max_held_bonds"] == sm.MAX_HELD_BONDS == 5
+        assert set(rules["limits"]) == {"title", "text", "restatement", "reason", "window_seconds", "threshold",
+                                        "bond_atto", "value_atto", "attempts", "page", "max_held_bonds"}
+        assert rules["limits"]["page"] == sm.PAGE_CAP == 20
+        assert "close() pays at most 1 + 5 transfers" in rules["settlement"]
+        assert "judged objections is not capped" in rules["settlement"]
+        assert "objections_of() and proposals() page at 20" in rules["settlement"]
+        assert rules["who"]["object"].endswith("none once the faithful objections reach the threshold")
         assert rules["limits"]["bond_atto"] == [str(10 ** 16), str(10 ** 19)]
         assert rules["limits"]["value_atto"] == [str(10 ** 17), str(10 ** 21)]
         assert rules["combine"] == {"F yes and D no": sm._combine("yes", "no"),
@@ -1058,6 +1240,73 @@ def _gates(fn):
     return out
 
 
+def _top_functions():
+    """Module functions and contract methods; a nested closure is walked as part of the function holding it."""
+    out = [n for n in TREE.body if isinstance(n, ast.FunctionDef)]
+    for cls in (n for n in TREE.body if isinstance(n, ast.ClassDef)):
+        out += [n for n in cls.body if isinstance(n, ast.FunctionDef)]
+    return out
+
+
+def _loops(fn):
+    return [n for n in ast.walk(fn) if isinstance(n, (ast.For, ast.comprehension))]
+
+
+def _constant(name):
+    value = getattr(sm, name, None) if name.isupper() else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _bound_of(fn, loop):
+    """The most times a loop can run, read off the source, or None when nothing bounds it.
+
+    Bounded means one of two shapes. range(n), where n is assigned once in the
+    function, to min(...) with a module constant among its arguments; or a
+    local list that starts as [] and is only appended to inside loops that are
+    themselves bounded.
+    """
+    it = loop.iter
+    if isinstance(it, ast.Call) and ast.unparse(it.func) == "range" and len(it.args) == 1 \
+            and isinstance(it.args[0], ast.Name):
+        name = it.args[0].id
+        sets = [n for n in ast.walk(fn) if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+                and any(isinstance(t, ast.Name) and t.id == name
+                        for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
+        if len(sets) != 1 or not isinstance(sets[0], ast.Assign):
+            return None
+        value = sets[0].value
+        if not (isinstance(value, ast.Call) and ast.unparse(value.func) == "min"):
+            return None
+        caps = [_constant(a.id) for a in value.args if isinstance(a, ast.Name) and _constant(a.id) is not None]
+        return min(caps) if caps else None
+    if isinstance(it, ast.Name):
+        name = it.id
+        sets = [n for n in ast.walk(fn) if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+                and any(isinstance(t, ast.Name) and t.id == name
+                        for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
+        if [ast.unparse(n.value) for n in sets if isinstance(n, ast.Assign)] != ["[]"] or len(sets) != 1:
+            return None
+        uses = [n for n in ast.walk(fn) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id == name]
+        if any(u.attr != "append" for u in uses):
+            return None
+        total = 0
+        for use in uses:
+            outer = [f for f in ast.walk(fn) if isinstance(f, ast.For) and f is not loop
+                     and any(x is use for x in ast.walk(f))]
+            if not outer:
+                return None
+            times = 1
+            for f in outer:
+                b = _bound_of(fn, f)
+                if b is None:
+                    return None
+                times *= b
+            total += times
+        return total
+    return None
+
+
 class TestStaticRules:
     # Writes open on purpose, each with its reason. A write added later that has no
     # unconditional refusing sender comparison and is not listed here fails.
@@ -1101,7 +1350,81 @@ class TestStaticRules:
         assert ast.unparse(_fn("_fail")).count("gl.vm.UserError(ERROR_EXPECTED + ' ' + message)") == 1
         assert sm.ERROR_EXPECTED == "[EXPECTED]"
         calls = [ast.unparse(n.func) for n in ast.walk(_fn("close")) if isinstance(n, ast.Call)]
-        assert calls.count("_fail") == 3 and "_clock" in calls
+        assert calls.count("_fail") == 4 and "_clock" in calls
+
+    # Loops that run over the characters of one argument, never over anything stored. Each reads a
+    # text only once its length is inside a cap. A loop added anywhere else must be bounded by a
+    # constant (see _bound_of), or this list must grow with a reason.
+    TEXT_LOOPS = {
+        "_whole": "the digits of one argument, read only once it is at most 40 characters",
+        "_text_problem": "the characters of one text, read only once its length is inside its cap",
+        "_address_problem": "the 40 hexadecimal characters of an address, read only once it is 42 characters long",
+        "_words": "the characters of a restatement or a proposal text, which the door has already capped",
+        "_instant_seconds": "the three parts of the message clock's date, which no caller writes",
+    }
+
+    def test_settlement_is_bounded_by_a_constant_of_at_most_five(self):
+        close = _fn("close")
+        loops = _loops(close)
+        assert len(loops) == 3                                    # the refund rows, the sum, the transfers
+        bounds = [_bound_of(close, loop) for loop in loops]
+        assert None not in bounds and max(bounds) <= 5, bounds
+        rows = next(x for x in loops if isinstance(x, ast.For) and ast.unparse(x.iter).startswith("range("))
+        held = next(n for n in ast.walk(close) if isinstance(n, ast.Assign)
+                    and ast.unparse(n.targets[0]) == ast.unparse(rows.iter.args[0]))
+        assert ast.unparse(held.value) == "min(int(p.faithful), int(p.threshold), MAX_HELD_BONDS)"
+        assert sm.MAX_HELD_BONDS == sm.MAX_THRESHOLD <= 5
+        # the guard: a state that broke the bound is refused whole, never settled in part
+        guard = next(n for n in close.body if isinstance(n, ast.If) and "held_count" in ast.unparse(n.test))
+        assert ast.unparse(guard.test) == "held_count != int(p.faithful)"
+        assert ast.unparse(guard.body[0]).startswith("_fail(")
+        assert close.body.index(guard) < close.body.index(rows)
+        # transfers: one for the value, and one per refund row, so at most 1 + MAX_HELD_BONDS
+        pays = [n for n in ast.walk(close) if isinstance(n, ast.Call) and ast.unparse(n.func).endswith("emit_transfer")]
+        assert len(pays) == 2
+        in_loops = [x for x in loops if isinstance(x, ast.For) and any(pay in list(ast.walk(x)) for pay in pays)]
+        assert len(in_loops) == 1 and _bound_of(close, in_loops[0]) <= sm.MAX_HELD_BONDS
+        assert "MAX_HELD_BONDS" in ast.get_docstring(close) and "1 + 5" in ast.get_docstring(close)
+
+    def test_no_method_loops_over_an_unbounded_count(self):
+        assert not [n for n in ast.walk(TREE) if isinstance(n, ast.While)]
+        public = {f.name for f in _writes()} | {f.name for f in _views()}
+        with_loops = set()
+        for fn in _top_functions():
+            for loop in _loops(fn):
+                with_loops.add(fn.name)
+                if fn.name in self.TEXT_LOOPS:
+                    continue
+                bound = _bound_of(fn, loop)
+                assert bound is not None and bound <= sm.PAGE_CAP, (fn.name, ast.unparse(loop.iter), bound)
+        text_helpers = with_loops & set(self.TEXT_LOOPS)
+        assert text_helpers == set(self.TEXT_LOOPS) and not (text_helpers & public)
+        assert with_loops - text_helpers == {"close", "objections_of", "proposals"}
+        # both lists are read a page at a time; the number of judged objections is not capped at the door
+        for name in ("objections_of", "proposals"):
+            fn = _fn(name)
+            assert [_bound_of(fn, loop) for loop in _loops(fn)] == [sm.PAGE_CAP], name
+            assert [a.arg for a in fn.args.args][-2:] == ["offset", "limit"], name
+        door = _fn("_no_more_objections")
+        assert not [n for n in ast.walk(door) if isinstance(n, ast.Attribute) and n.attr == "judged"]
+        # the text helpers really do read their text only once it is capped
+        door = _fn("_text_problem")
+        cap = next(i for i, n in enumerate(door.body) if isinstance(n, ast.If) and "len(text) > most" in ast.unparse(n.test))
+        assert cap < next(i for i, n in enumerate(door.body) if isinstance(n, ast.For))
+        assert "s and len(s) <= 40 and all(" in ast.unparse(_fn("_whole"))
+
+    def test_the_bound_reader_reads_bounds(self):
+        tree = ast.parse("def f(self):\n    n = min(self.k, PAGE_CAP)\n    out = []\n    for i in range(n):\n"
+                         "        out.append(i)\n    for x in out:\n        pass\n")
+        fn = tree.body[0]
+        assert [_bound_of(fn, x) for x in _loops(fn)] == [20, 20]
+        for body in ("    for i in range(1, self.k + 1):\n        pass\n",
+                     "    n = self.k\n    for i in range(n):\n        pass\n",
+                     "    n = min(self.k, self.j)\n    for i in range(n):\n        pass\n",
+                     "    for x in self.rows:\n        pass\n",
+                     "    out = list(self.rows)\n    for x in out:\n        pass\n"):
+            fn = ast.parse("def f(self):\n" + body).body[0]
+            assert _bound_of(fn, _loops(fn)[0]) is None, body
 
     def test_everything_interpolated_into_a_prompt_is_fenced_or_owned_by_the_contract(self):
         owned = {n for n in dir(sm) if n.isupper()} | {"label", "tag", "body", "blocks", "question", "proposal",

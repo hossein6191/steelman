@@ -6,14 +6,17 @@
  *   STATE=/some/dir/run.json RESUME=1 node tests/on_chain/smoke.mjs   # the same, with the state kept elsewhere
  *
  * Four generated accounts play the story: P proposes, A objects with a faithful restatement, B
- * objects with a strawman, and S is a stranger with no part in either proposal. The recipient R is
- * a fresh address nobody holds a key for; it only ever receives.
+ * objects with a strawman, and S is a stranger who arrives once P1 is already decided. The
+ * recipient R is a fresh address nobody holds a key for; it only ever receives.
  *
  *   1  deploy; a proposal with a one-minute window is refused and its 3 GEN come back.
- *   2  P1 "Translate the beginner guide": 3 GEN, threshold 1, bond 1 GEN, window 300 s. B's strawman
+ *   2  P1 "Translate the beginner guide": 3 GEN, threshold 1, bond 1 GEN, window 600 s. B's strawman
  *      and A's faithful restatement are sent back to back, so both are judged inside the window.
  *      The strawman is read as distorted and B's bond goes to P at once; A's restatement is read
- *      as faithful, counts, and A's bond is held.
+ *      as faithful, counts, and A's bond is held. That is P1's threshold, so when S then restates
+ *      P1 faithfully in other words, the objection is not taken: no model is asked and S's bond
+ *      comes back in the same transaction. This is the settlement bound: a proposal never holds
+ *      more bonds than its threshold, so a close never pays more than 1 + 5 transfers.
  *   3  P2, the revised proposal (the rewritten guide), window 900 s. Refusals that ask no model:
  *      a close before the window, the proposer objecting, a wrong bond. B's strawman, put to P2,
  *      is distorted again; S copies it in other case and spacing and is refused.
@@ -27,7 +30,12 @@
  * minute), never with views (gen_call is 30 a minute per client, shared with sim_fundAccount). A
  * round no majority carried stores nothing; it is sent again and both transactions are kept. Every
  * step is saved as it is made, so a run cut off part way continues without sending anything twice.
- * A whole run takes about 20 to 25 minutes, most of it P2's 900-second window.
+ * A whole run takes about 20 to 25 minutes, most of it P2's 900-second window. P1's window is 600 s
+ * so that S's late objection lands inside it even if A's round has to be sent again; it adds no time,
+ * because P1 is closed after P2's refusals.
+ *
+ * A state file remembers the sha256 of the contract it deployed, and a RESUME against a state made
+ * from another contracts/steelman.py stops before sending anything.
  */
 import { createClient, createAccount } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
@@ -64,6 +72,12 @@ const tally = (v) => `${v.agree} agree, ${v.disagree} disagree, ${v.idle} idle`;
 // ---------- state: keys, addresses and every step already made survive a cut-off run ----------
 const st = existsSync(STATE) && process.env.RESUME ? JSON.parse(readFileSync(STATE, "utf8")) : {};
 st.keys = st.keys || {}; st.steps = st.steps || {}; st.views = st.views || {}; st.order = st.order || [];
+const SOURCE_SHA = createHash("sha256").update(readFileSync(new URL("../../contracts/steelman.py", import.meta.url))).digest("hex");
+if (st.source_sha256 && st.source_sha256 !== SOURCE_SHA) {
+  console.log(`the state file ${STATE} belongs to a run of another contracts/steelman.py (sha256 ${st.source_sha256.slice(0, 12)}...); start a fresh run without RESUME, or name another STATE`);
+  process.exit(2);
+}
+st.source_sha256 = SOURCE_SHA;
 const save = () => {
   writeFileSync(STATE, JSON.stringify(st, null, 1));
   const { keys, ...shown } = st;       // the record carries no key
@@ -224,7 +238,7 @@ const untilClosable = async (pid) => {
 const notYet = (r) => { const m = /open for another (\d+) seconds/.exec(r.msg); return r.exec === "ERROR" && m ? (Number(m[1]) + 15) * 1000 : 0; };
 
 // ---------- the demonstration ----------
-const VALUE = 3n * GEN, BOND = 1n * GEN, WINDOW = 300, WINDOW2 = 900;
+const VALUE = 3n * GEN, BOND = 1n * GEN, WINDOW = 600, WINDOW2 = 900;
 const TITLE = "Translate the beginner guide";
 const TEXT = "Spend 3 GEN from the community fund to pay one translator to translate the project's beginner guide (the twelve-page getting-started document) into Spanish and Portuguese. The translator is paid only after both translated versions are published on the project's documentation site. The rest of the fund is not touched by this proposal.";
 // P2 changes one thing: it names the rewritten guide, which is what A's reason was about
@@ -234,6 +248,9 @@ const FAITHFUL = "Pay one translator 3 GEN from the fund to translate the twelve
 const STRAWMAN = "Hand the whole fund to one person to translate the entire website into every language they choose.";
 const REASON_A = "The beginner guide is being rewritten next month, so translating the current version now pays for text that is about to be replaced.";
 const REASON_B = "Nobody should get the whole fund for a translation job; the money is needed for hosting.";
+// S's restatement of P1: faithful, and in other words than A's
+const FAITHFUL_S = "Use 3 GEN of the community fund to have a single translator put the twelve-page beginner guide into Spanish and Portuguese, paying only after both are on the documentation site; nothing else in the fund is spent.";
+const REASON_S = "Machine translation of a guide this short is good enough and costs nothing at all.";
 const W = (k) => ({ [k]: acct[k].address });
 // what an objection moves for its objector and the proposer, by how it was read
 const objMoves = (who) => (j) => j?.verdict === "distorted" ? { [who]: -BOND, p: BOND } : j?.verdict === "faithful" ? { [who]: -BOND, p: 0n } : { [who]: 0n, p: 0n };
@@ -253,10 +270,10 @@ console.log(`      Steelman at ${st.contract}`);
 }
 
 // ================================================================ 2
-console.log(`\n[${stamp()}] ---- 2: P1, a strawman and a faithful restatement`);
+console.log(`\n[${stamp()}] ---- 2: P1, a strawman, a faithful restatement, and one too many`);
 {
   const p1 = await call("proposeP1", "p", "propose", [TITLE, TEXT, R, WINDOW, 1, String(BOND)], { value: VALUE, watch: W("p"), expect: { p: -VALUE } });
-  ok("P1 is opened with 3 GEN behind it, threshold 1, bond 1 GEN, window 300 s", p1.j?.ok === true && p1.j?.proposal === "P1" && p1.j?.closes_at - p1.j?.opened_at === WINDOW && moved(p1, "p", -VALUE), `${votes(p1)}  ${p1.msg.slice(0, 120)}`);
+  ok("P1 is opened with 3 GEN behind it, threshold 1, bond 1 GEN, window 600 s", p1.j?.ok === true && p1.j?.proposal === "P1" && p1.j?.closes_at - p1.j?.opened_at === WINDOW && moved(p1, "p", -VALUE), `${votes(p1)}  ${p1.msg.slice(0, 120)}`);
   st.P1 = p1.j?.proposal || "P1"; save();
   // both objections go out back to back, so both are judged inside the 300-second window
   const sb = ["strawmanP1", "b", "object", [st.P1, STRAWMAN, REASON_B], { value: BOND, watch: { b: acct.b.address, p: acct.p.address }, expect: objMoves("b") }];
@@ -267,8 +284,11 @@ console.log(`\n[${stamp()}] ---- 2: P1, a strawman and a faithful restatement`);
   ok("and B's bond goes to the proposer in the same transaction", b1.j?.to_proposer === String(BOND) && moved(b1, "b", -BOND) && moved(b1, "p", BOND), JSON.stringify(b1.delta));
   ok("A's restatement is read as faithful and counts", a1.j?.verdict === "faithful" && a1.j?.counted === true && a1.j?.faithful === 1, `${votes(a1)}  ${a1.j?.verdict || a1.j?.reason || a1.msg.slice(0, 80)}`);
   ok("and A's bond is held, not spent", a1.j?.held === String(BOND) && moved(a1, "a", -BOND), JSON.stringify(a1.delta));
+  // P1 has its threshold now, so its outcome is decided: S's faithful restatement is not taken
+  const late = await call("lateP1", "s", "object", [st.P1, FAITHFUL_S, REASON_S], { value: BOND, watch: W("s"), expect: { s: 0n } });
+  ok("S restates P1 faithfully after the threshold: refused with no model asked, the bond back in the same transaction", late.j?.ok === false && String(late.j?.reason).includes("already has 1 faithful objection") && late.j?.returned === String(BOND) && moved(late, "s", 0n), `${votes(late)}  ${late.j?.reason || late.msg.slice(0, 90)}`);
   const row = await seen("P1open", "proposal", [st.P1]);
-  ok("proposal(P1): one faithful objection, one bond held, and it would be blocked", row.faithful === 1 && row.distorted === 1 && row.held === String(BOND) && row.would_be === "blocked", JSON.stringify({ faithful: row.faithful, distorted: row.distorted, held: row.held, would_be: row.would_be }));
+  ok("proposal(P1): one faithful objection, one bond held, it would be blocked, and it takes no more", row.faithful === 1 && row.distorted === 1 && row.judged === 2 && row.held === String(BOND) && row.would_be === "blocked" && row.taking_objections === false && row.max_held_bonds === 1, JSON.stringify({ faithful: row.faithful, judged: row.judged, held: row.held, would_be: row.would_be, taking_objections: row.taking_objections, max_held_bonds: row.max_held_bonds }));
 }
 
 // ================================================================ 3
@@ -295,7 +315,7 @@ console.log(`\n[${stamp()}] ---- 4: a stranger closes P1`);
   if (!st.steps.closeP1?.done) await untilClosable(st.P1);
   const c1 = await call("closeP1", "s", "close", [st.P1], { watch: { p: acct.p.address, a: acct.a.address, s: acct.s.address }, expect: { p: VALUE, a: BOND, s: 0n }, again: notYet });
   ok("S, who has no part in P1, closes it after the window: blocked", c1.j?.status === "blocked" && c1.j?.paid_to === "proposer", `${votes(c1)}  ${c1.msg.slice(0, 120)}`);
-  ok("the 3 GEN go back to the proposer and A's bond back to A, in the same call", moved(c1, "p", VALUE) && moved(c1, "a", BOND) && moved(c1, "s", 0n) && c1.j?.bonds_returned === String(BOND), JSON.stringify(c1.delta));
+  ok("the 3 GEN go back to the proposer and A's bond, the only one held, back to A, in the same call", moved(c1, "p", VALUE) && moved(c1, "a", BOND) && moved(c1, "s", 0n) && c1.j?.bonds_returned === String(BOND) && c1.j?.objectors_repaid === 1, JSON.stringify(c1.delta));
 }
 
 // ================================================================ 5
@@ -312,8 +332,8 @@ console.log(`\n[${stamp()}] ---- 6: the views, the code, and the money`);
 {
   const p1 = await seen("P1", "proposal", [st.P1]), p2 = await seen("P2", "proposal", [st.P2]);
   ok("proposal(P1).status is blocked and proposal(P2).status is passed", p1.status === "blocked" && p2.status === "passed" && p1.held === "0", JSON.stringify({ P1: p1.status, P2: p2.status }));
-  const of1 = await seen("of1", "objections_of", [st.P1]);
-  ok("objections_of(P1): the strawman and the faithful restatement, both judged", Array.isArray(of1.ids) && of1.ids.length === 2, JSON.stringify(of1));
+  const of1 = await seen("of1", "objections_of", [st.P1, 0, 20]);
+  ok("objections_of(P1, 0, 20): the strawman and the faithful restatement, both judged, total 2", Array.isArray(of1.ids) && of1.ids.length === 2 && of1.total === 2 && of1.limit === 20, JSON.stringify(of1));
   // the two were sent back to back, so a round sent a second time can swap their ids: find each by its author
   const rows = [];
   for (const [n, id] of (of1.ids || []).entries()) rows.push(await seen("objP1_" + n, "objection", [id]));
@@ -326,7 +346,7 @@ console.log(`\n[${stamp()}] ---- 6: the views, the code, and the money`);
   ok("stats(): two proposals, one blocked, one passed, nothing held", stats.proposals === 2 && stats.blocked === 1 && stats.passed === 1 && stats.value_held === "0" && stats.bonds_held === "0" && stats.balance_owed === "0", JSON.stringify(stats));
   ok("the contract's own balance is zero", (await balance(st.contract)) === 0n, String(await balance(st.contract)));
   const rules = await seen("rules", "rules", []);
-  ok("rules(): the agreement rule in words, with the limits", String(rules.compared).includes("exact string equality") && rules.limits?.attempts === 3, Object.keys(rules).join(","));
+  ok("rules(): the agreement rule in words, with the limits and the settlement bound", String(rules.compared).includes("exact string equality") && rules.limits?.attempts === 3 && rules.limits?.max_held_bonds === 5 && rules.limits?.page === 20 && String(rules.settlement).includes("1 + 5") && String(rules.settlement).includes("not capped"), Object.keys(rules).join(","));
 
   const sha = (b) => createHash("sha256").update(b).digest("hex");
   const file = readFileSync(new URL("../../contracts/steelman.py", import.meta.url));
